@@ -16,7 +16,7 @@ reported in the paper, and the commit-message baseline.
 | `code/model/` | Final training and evaluation code (`train.py`, `dataset_utils.py`, `evaluate_cvefixes.py`, `models.py`, `model_outputs.py`, `provenance.py`, `ablation.py`, `operational_metrics.py`, `leakage_free_eval.py`, statistics and plotting scripts, `requirements.txt`). `code/pipeline/GIT_STATE.txt` records the exact working tree and file hashes used for the final runs |
 | `code/pipeline/` | Exact runner scripts and commands for the event-type-matched runs (`run_v3.sh`, `exact_commands.txt`, `prebuild_cache.py`, `split_check.py`, `task*_*.sh`), environment record, code hashes (`SHA256_after.txt`), full run log, and diffs against the previous release |
 | `code/tests/` | Unit/replay tests run before training (commit-only sampling, split replay) and pre-flight data scans |
-| `code/analysis/` | Commit-message baseline (`commit_message_baseline.py`) |
+| `code/analysis/` | Commit-message baseline (`commit_message_baseline.py`) and the shortcut probe of Section 6.4 (`shortcut_probe.py`) |
 | `data/commit_messages/` | Commit lists (`urls_core.tsv`, `urls_extra.tsv`), retrieved and cleaned messages (`messages_clean.tsv`), unavailable commits (`failed.tsv`), and the retrieval script (`fetch_messages.sh`) |
 | `data/repo_metadata.json` | Static repository metadata snapshot used for the metadata feature block |
 | `results/matched_sampling/` | Event-type-matched runs (headline results). See its `README.md` |
