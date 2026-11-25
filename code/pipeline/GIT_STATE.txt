@@ -1,0 +1,22 @@
+Working tree used for the final (rerun_v3) runs: git HEAD b56241213e2db6962c066850841a0422cf2979a2 plus these uncommitted changes
+(M = modified tracked file, ?? = untracked file; files not listed are identical to HEAD):
+ M dataset_utils.py
+ M evaluate_cvefixes.py
+ M train.py
+?? ablation.py
+?? leakage_free_eval.py
+?? model_outputs.py
+?? operational_metrics.py
+?? provenance.py
+
+sha256 of each file:
+0a449ba8fd5f8b9e599b2a1269a6569e8bd8ab9bc7f1638036559351ba72af89  train.py
+88074565f14c9c87e7aa97b2f2bef49c40605ebf13889b19bd7bf41fd3e42894  dataset_utils.py
+5c28f1dcc4ba6fea5a67dc5f0ef30ca813563ea8b40b4748c31da11480db64ee  evaluate_cvefixes.py
+7727a1bbf0cf818ce8fc6dfa595002dd81d32e4fb5655fb8fc573c1e03e0ec4d  provenance.py
+02d6ef739c79e3837b012baf346c36c5051610dc8f17dc88e2bb927adaf45d4b  ablation.py
+fd962a81fc24cfaf8e3d762b5dc61e39703fe93f5c4eadb94a7c6dc03fb72d7f  leakage_free_eval.py
+cb0d691f756df6e0c2f55d33ba12b03d4809bd07c6ab9240d6e13e45210f5636  model_outputs.py
+4ed3b1b209b28b99e6a3abf34c5ac3999071997edf92e955abf5ff10da2fd2d5  operational_metrics.py
+de654228ce50eb924146562728ec72f4d4dadc4373603a842f9ebd2f75230b16  models.py
+def7ad762a270b1f7bfcd9abf10156241aca1b7ec19df813870ed2e6db9328e8  helper.py

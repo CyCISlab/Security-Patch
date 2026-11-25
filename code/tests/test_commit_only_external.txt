@@ -1,0 +1,6 @@
+repos: ['DavidJClark_phpVMS-PopUpNews.csv', 'auracms_AuraCMS.csv', 'NaCl-Ltd_pref-shimane-cms.csv', 'kolya5544_BearFTP.csv', 'ScratchVerifier_ScratchOAuth2.csv', 'TooTallNate_node-degenerator.csv']
+PASS E1 default path identical to original (balanced and realistic)
+PASS E2 balanced Commit-only: fixes unchanged, 6 benign all Commit+verified, reproducible (3 repos with fewer Commit benign windows than fixes; 10 fixes)
+PASS E3 realistic Commit-only = fixes + all non-fix Commit windows
+PASS E4 model folder names match train.py naming; default names unchanged
+ALL PASS

@@ -1,0 +1,8 @@
+rerun_v3 environment record, 2026-11-22 12:31:05
+git HEAD: b56241213e2db6962c066850841a0422cf2979a2 (plus uncommitted changes: rerun_v3/01_code_changes/*.diff on top of runs_v2 changes)
+Python 3.13.13
+TensorFlow 2.21.0 | Keras 3.14.1 | NumPy 2.4.6 | pandas 2.3.3 | scikit-learn 1.9.0
+built with 12.5.1 cuDNN 9
+NVIDIA GeForce RTX 3060 Laptop GPU, 595.84, 6144 MiB
+Linux 7.0.0-30-generic
+python3 = /home/anonusr/miniconda/bin/python3

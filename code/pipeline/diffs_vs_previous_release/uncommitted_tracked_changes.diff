@@ -1,0 +1,1010 @@
+diff --git a/.gitignore b/.gitignore
+index f20447f..35b08f2 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -82,3 +82,8 @@ last_run.log
+ # Claude config (project-specific, not code)
+ CLAUDE.md
+ .claude/
++
++# Organised workspace (2026-11-13): archives, deliverables, docs are local only
++/archive/
++/deliverables/
++/docs/
+diff --git a/dataset_utils.py b/dataset_utils.py
+index 57fbcab..7873cab 100644
+--- a/dataset_utils.py
++++ b/dataset_utils.py
+@@ -243,6 +243,13 @@ def add_graphql_features(cur_repo, data_path, file):
+     cur_repo["created_at"] = pd.to_datetime(cur_repo["created_at"], format="mixed", utc=True)
+     cur_repo = cur_repo.sort_values("created_at")
+ 
++    # pandas 2.x can infer different datetime resolutions (us vs ns) for the two
++    # sides, and merge_asof refuses mismatched key dtypes. Cast both to ns;
++    # timestamps are unchanged, only the storage resolution is unified.
++    cur_repo["created_at"] = cur_repo["created_at"].astype("datetime64[ns, UTC]")
++    gql_features = gql_features.assign(
++        commit_date=gql_features["commit_date"].astype("datetime64[ns, UTC]"))
++
+     # merge_asof: for each event in cur_repo, find the most recent GraphQL
+     # commit snapshot that occurred at or before the event's timestamp.
+     # This ensures no future data leakage — each event only sees GraphQL
+@@ -576,7 +583,14 @@ def fix_repo_shape(all_set, cur_repo, metadata=False, update=lambda cur: None):
+     # PR reviews, and commits in a short time span).
+     # Uses np.searchsorted for O(n log n) efficiency instead of O(n²).
+     timestamps = cur_repo.index.get_level_values("created_at")
+-    ts_seconds = np.sort(timestamps.astype(np.int64) / 1e9)
++    # RUNBOOK_v2 (2026-11-13, option B): pin the historical behaviour.  Every
++    # with-metadata cache and model was built from datetime64[us] timestamps,
++    # for which `int64 / 1e9` is NOT seconds: the "+-3600" window is really
++    # +-3.6e6 s (about +-1000 h, +-42 days).  Converting to "us" first makes the
++    # result independent of pandas' datetime resolution (the 2026-11-12 ns cast
++    # in add_graphql_features had silently switched some repos to a true +-1 h).
++    # See runs_v2/NOTES.md s4.
++    ts_seconds = np.sort(timestamps.as_unit("us").astype(np.int64) / 1e9)
+     right_idx = np.searchsorted(ts_seconds, ts_seconds + 3600, side="right")
+     left_idx = np.searchsorted(ts_seconds, ts_seconds - 3600, side="left")
+     burst_rates = (right_idx - left_idx - 1).clip(min=0).astype(float)
+@@ -752,8 +766,11 @@ def create_dataset(
+     backs,
+     metadata=False,
+     comment="",
++    benign_commit_only=False,
+ ):
+     """Process all repo CSVs into model-ready Repository objects.
++    # rerun_v3 (Commit-only benign targets): benign_commit_only=True draws benign targets only from events of
++    type "Commit" (every vulnerable target is a Commit). Default False = unchanged behaviour.
+ 
+     This is the main dataset construction function.  For each repo CSV file
+     in the data directory, it:
+@@ -899,6 +916,11 @@ def create_dataset(
+         tqdm_update("graphql features")
+         cur_repo = add_graphql_features(cur_repo, data_path, file)
+ 
++        # rerun_v3 (Commit-only benign targets): row marker, set before fix_repo_shape drops "type";
++        # it is not a feature (dropped with "Vuln" below, before any window is cut).
++        if benign_commit_only:
++            cur_repo["_target_is_commit"] = (cur_repo["type"].astype(str) == "Commit").astype(float)
++
+         # ---- Feature engineering: derive 16 temporal features + normalise ----
+         tqdm_update("fix_repo_shape")
+         cur_repo = fix_repo_shape(all_set, cur_repo, metadata=metadata, update=tqdm_update)
+@@ -911,12 +933,17 @@ def create_dataset(
+ 
+         # Benign commits: randomly sample (ratio × num_vulns) from non-vuln events.
+         # This controls class balance — ratio=1 gives 1:1 vuln:benign per repo.
+-        benigns = cur_repo.index[cur_repo["Vuln"] == 0].tolist()
++        if benign_commit_only:  # rerun_v3 (Commit-only benign targets): same draw, candidates restricted to Commit events
++            benigns = cur_repo.index[(cur_repo["Vuln"] == 0) & (cur_repo["_target_is_commit"] == 1)].tolist()
++        else:
++            benigns = cur_repo.index[cur_repo["Vuln"] == 0].tolist()
+         random.shuffle(benigns)
+         benigns = benigns[: benign_vuln_ratio * len(vulns)]
+ 
+         # Drop the label column before window extraction (model shouldn't see it)
+         cur_repo = cur_repo.drop(["Vuln"], axis=1)
++        if benign_commit_only:
++            cur_repo = cur_repo.drop(["_target_is_commit"], axis=1)
+ 
+         # ---- Extract event windows ----
+         tqdm_update("extract_window")
+@@ -999,6 +1026,7 @@ def extract_dataset(
+     comment="",
+     data_location="data_collection",
+     cache_location=DATASET_DIRNAME,
++    benign_commit_only=False,
+ ):
+     """Load a cached dataset or create a new one from raw CSV files.
+ 
+@@ -1028,6 +1056,10 @@ def extract_dataset(
+     """
+     dirname = make_new_dir_name(aggr_options, backs, benign_vuln_ratio, days, hours, resample, metadata, comment)
+     path_name = os.path.join(cache_location, dirname)
++    # rerun_v3 (Commit-only benign targets): the flag and the cache name must agree
++    if benign_commit_only != ("commitonly" in (comment or "")):
++        raise ValueError(f"benign_commit_only={benign_commit_only} but cache comment is {comment!r}: "
++                         "Commit-only caches must carry 'commitonly' in their name, and only they may")
+ 
+     if (
+         cache
+@@ -1063,6 +1095,7 @@ def extract_dataset(
+                 backs,
+                 metadata=metadata,
+                 comment=comment,
++                benign_commit_only=benign_commit_only,
+             )
+     else:
+         # No cache available — create dataset from raw CSV files
+@@ -1077,6 +1110,7 @@ def extract_dataset(
+             backs,
+             metadata=metadata,
+             comment=comment,
++            benign_commit_only=benign_commit_only,
+         )
+ 
+     return all_repos, dirname, column_names
+diff --git a/evaluate_cvefixes.py b/evaluate_cvefixes.py
+index 46ae2fd..1770b88 100644
+--- a/evaluate_cvefixes.py
++++ b/evaluate_cvefixes.py
+@@ -69,6 +69,9 @@ from dataset_utils import (
+     add_graphql_features,
+ )
+ from helper import Repository, safe_mkdir, EnumAction, add_metadata
++from model_outputs import predict_logits                 # RUNBOOK_v2: logits
++from provenance import ordered_events_from_frame, lookup  # RUNBOOK_v2: repo + hash
++import hashlib
+ 
+ logger = logging.getLogger(__name__)
+ coloredlogs.install(fmt="%(asctime)s %(levelname)s %(message)s")
+@@ -82,7 +85,7 @@ CVEFIXES_DIR = CVEFIXES_DIR_BASE  # May be overridden by --enriched flag
+ # Model path helper
+ # =============================================================================
+ 
+-def make_model_dir_name(aggr, backs, metadata, seed=42):
++def make_model_dir_name(aggr, backs, metadata, seed=42, comment=""):
+     """Construct the model checkpoint directory name from training parameters.
+ 
+     Must match the naming convention used by train.py so we load the correct
+@@ -101,18 +104,98 @@ def make_model_dir_name(aggr, backs, metadata, seed=42):
+     name = f"{aggr}_R1_B{backs}"
+     if metadata:
+         name += "_meta"
++    if comment:  # rerun_v3 (Commit-only benign targets): same order as train.py / make_new_dir_name
++        name += f"_{comment}"
+     if seed != 42:
+         name += f"_s{seed}"
+     return name
+ 
+ 
++N_FOLDS = 10
++
++
++def load_ensemble(model_dir, model_name, legacy_last_fold=False):
++    """RUNBOOK_v2 Task 1: load all 10 fold models of a run (models/<dir>/<model>_folds/fold_k.keras).
++
++    Missing fold models are a hard error: the last-fold model must not be used
++    on its own.  --legacy-last-fold reproduces the pre-RUNBOOK_v2 behaviour
++    (single models/<dir>/<model>.keras) for comparison only.
++    """
++    if legacy_last_fold:
++        paths = [os.path.join("models", model_dir, f"{model_name}.keras")]
++    else:
++        paths = [os.path.join("models", model_dir, f"{model_name}_folds", f"fold_{k}.keras")
++                 for k in range(N_FOLDS)]
++    missing = [p for p in paths if not os.path.exists(p)]
++    if missing:
++        print(f"FATAL: missing model files: {missing}")
++        sys.exit(3)
++    print(f"[ENSEMBLE] {'LEGACY last-fold model' if legacy_last_fold else f'{len(paths)} fold models'}: "
++          f"{os.path.dirname(paths[0])}")
++    return [tf.keras.models.load_model(p, compile=False) for p in paths]
++
++
++def ensemble_predict(fold_models, X):
++    """Mean probability, mean logit, and per-fold probabilities (n_folds, n)."""
++    probs = np.stack([m.predict(X, verbose=0).reshape(-1) for m in fold_models])
++    logits = np.stack([predict_logits(m, X) for m in fold_models])
++    return probs.mean(axis=0), logits.mean(axis=0), probs
++
++
++def reload_ensemble(fold_models, model_dir, args):
++    """--reload-every: drop the fold models, their logit sub-models and every compiled GPU program, then load the
++    same fold model files again. Batches are unchanged, so scores are unchanged; memory used by programs compiled
++    for earlier repo sizes is freed (runs_v2/NOTES.md s9, s11). Checked on the GPU first
++    (runs_v2/12_oom_fix/reload_check.py)."""
++    import gc
++    import model_outputs
++    del fold_models
++    model_outputs._PARTS_CACHE.clear()
++    tf.keras.backend.clear_session()
++    gc.collect()
++    return load_ensemble(model_dir, args.model, args.legacy_last_fold)
++
++
++def ensemble_predict_padded(fold_models, X, multiple=256):
++    """ensemble_predict on X padded with zero rows to a multiple of `multiple`, padded rows dropped (--pad-batches).
++
++    Every predict call then sees the same batch shapes (predict: batches of 32; logits: 256), so the GPU compiles
++    each model once instead of once per repo size (runs_v2/NOTES.md s9). Rows are scored independently; the
++    padding rows are discarded. Checked on the GPU before use (runs_v2/12_oom_fix/pad_check.py).
++    """
++    n = len(X)
++    m = -(-n // multiple) * multiple
++    if m != n:
++        X = np.concatenate([X, np.zeros((m - n,) + X.shape[1:], dtype=X.dtype)])
++    pred, logit, probs = ensemble_predict(fold_models, X)
++    return pred[:n], logit[:n], probs[:, :n]
++
++
++def commit_list_fingerprint(prov, labels):
++    """sha256 over sorted (repo, created_at, event_idx, label) -- identical sets give identical hashes."""
++    rows = sorted(zip(prov["repo"], prov["created_at"], [int(i) for i in prov["event_idx"]],
++                      [int(l) for l in labels]))
++    return hashlib.sha256(repr(rows).encode()).hexdigest()
++
++
++def stack_provenance(prov_rows):
++    """prov_rows: list of (repo, hash, event_type, created_at, event_idx, verified) tuples."""
++    keys = ["repo", "hash", "event_type", "created_at", "event_idx", "prov_verified"]
++    cols = list(zip(*prov_rows)) if prov_rows else [[]] * len(keys)
++    out = {k: np.asarray(c) for k, c in zip(keys, cols)}
++    out["event_idx"] = out["event_idx"].astype(np.int64)
++    out["prov_verified"] = out["prov_verified"].astype(bool)
++    return out
++
++
+ # =============================================================================
+ # process_repo — Per-repo feature engineering and window extraction
+ # =============================================================================
+ 
+ def process_repo(csv_path, aggr_options, backs, metadata_dict, language_vocab,
+-                 benign_vuln_ratio=1, realistic=False):
++                 benign_vuln_ratio=1, realistic=False, sample_seed=0, benign_commit_only=False):
+     """Load a repo CSV and extract event windows for vuln + benign commits.
++    rerun_v3: benign_commit_only=True keeps only Commit events as benign targets (balanced and realistic).
+ 
+     Applies the same feature engineering pipeline as the training data:
+     metadata enrichment → GraphQL features → fix_repo_shape() → window extraction.
+@@ -160,6 +243,8 @@ def process_repo(csv_path, aggr_options, backs, metadata_dict, language_vocab,
+     if "Hash" in cur_repo.columns:
+         cur_repo["Hash"] = cur_repo["Hash"].fillna("")
+     cur_repo = cur_repo.fillna(0)
++    # RUNBOOK_v2: raw copy for provenance (repo, hash) recovery after windowing
++    prov_raw = cur_repo[["created_at", "type", "Hash", "Vuln"]].copy()
+ 
+     # Skip repos with no vulnerability-fixing commits
+     number_of_vulns = cur_repo[cur_repo["Vuln"] != 0].shape[0]
+@@ -197,6 +282,10 @@ def process_repo(csv_path, aggr_options, backs, metadata_dict, language_vocab,
+     # Add GraphQL recency/churn features (7 columns)
+     cur_repo = add_graphql_features(cur_repo, CVEFIXES_DIR, repo_name)
+ 
++    # rerun_v3 (Commit-only benign targets): row marker before fix_repo_shape drops "type"; not a feature
++    if benign_commit_only:
++        cur_repo["_target_is_commit"] = (cur_repo["type"].astype(str) == "Commit").astype(float)
++
+     # Feature engineering: derive 16 temporal features + z-score normalisation
+     all_set = set()
+     cur_repo = fix_repo_shape(all_set, cur_repo, metadata=use_metadata)
+@@ -207,13 +296,19 @@ def process_repo(csv_path, aggr_options, backs, metadata_dict, language_vocab,
+         logger.info(f"Skipping {repo_name}: no vuln commits after processing")
+         return None, None, repo_name
+ 
++    benign_mask = cur_repo["Vuln"] == 0
++    if benign_commit_only:  # rerun_v3 (Commit-only benign targets): candidates restricted to Commit events
++        benign_mask = benign_mask & (cur_repo["_target_is_commit"] == 1)
++        cur_repo = cur_repo.drop(["_target_is_commit"], axis=1)
+     if realistic:
+         # REALISTIC mode: test on ALL non-vuln commits (natural class imbalance)
+-        benigns = cur_repo.index[cur_repo["Vuln"] == 0].tolist()
++        benigns = cur_repo.index[benign_mask].tolist()
+     else:
+         # BALANCED mode: sample benign commits at the specified ratio
+-        benigns = cur_repo.index[cur_repo["Vuln"] == 0].tolist()
+-        random.shuffle(benigns)
++        benigns = cur_repo.index[benign_mask].tolist()
++        # RUNBOOK_v2: fixed, per-repo seeded sample so the external commit list is
++        # identical across every seed/model/mode (previously unseeded random.shuffle).
++        random.Random(f"{sample_seed}:{repo_name}").shuffle(benigns)
+         benigns = benigns[:benign_vuln_ratio * len(vulns)]
+ 
+     # Drop label column before window extraction
+@@ -227,22 +322,24 @@ def process_repo(csv_path, aggr_options, backs, metadata_dict, language_vocab,
+         ).set_index("idx")
+ 
+     # Extract windows for vulnerability-fixing commits
+-    vuln_windows = []
++    vuln_windows, vuln_kept = [], []
+     for event_idx in vulns:
+         try:
+             res = get_event_window(cur_repo, event_idx, aggr_options, backs=backs)
+             if res is not None and len(res) > 0:
+                 vuln_windows.append(res)
++                vuln_kept.append(event_idx)
+         except Exception:
+             continue  # Skip windows that fail (e.g. too close to sequence boundary)
+ 
+     # Extract windows for benign commits
+-    benign_windows = []
++    benign_windows, benign_kept = [], []
+     for event_idx in benigns:
+         try:
+             res = get_event_window(cur_repo, event_idx, aggr_options, backs=backs)
+             if res is not None and len(res) > 0:
+                 benign_windows.append(res)
++                benign_kept.append(event_idx)
+         except Exception:
+             continue
+ 
+@@ -254,15 +351,22 @@ def process_repo(csv_path, aggr_options, backs, metadata_dict, language_vocab,
+     windows = vuln_windows + benign_windows
+     labels = [1] * len(vuln_windows) + [0] * len(benign_windows)
+ 
+-    return list(zip(windows, labels)), len(vuln_windows), repo_name
++    # RUNBOOK_v2: provenance per window, verified against timestamp + label
++    targets = [(e[0], e[1], lab) for e, lab in zip(vuln_kept + benign_kept, labels)]
++    events = ordered_events_from_frame(prov_raw, CVEFIXES_DIR, repo_name)
++    hashes, types, oks = lookup(events, targets)
++    prov = [(repo_name, h, t, str(e[0]), int(e[1]), ok)
++            for h, t, ok, e in zip(hashes, types, oks, vuln_kept + benign_kept)]
++
++    return list(zip(windows, labels, prov)), len(vuln_windows), repo_name
+ 
+ 
+ # =============================================================================
+-# _pad_and_predict — Pad windows and run model inference
++# _pad_windows — Pad windows to the model's input shape
+ # =============================================================================
+ 
+-def _pad_and_predict(model, windows, expected_seq, expected_features):
+-    """Pad a list of variable-length windows and run model prediction.
++def _pad_windows(windows, expected_seq, expected_features):
++    """Pad a list of variable-length windows to the model's input shape.
+ 
+     Handles dimension mismatches between the test data and the model's
+     expected input shape.  Windows may have different sequence lengths
+@@ -312,7 +416,7 @@ def _pad_and_predict(model, windows, expected_seq, expected_features):
+             # Test windows longer — keep only the last expected_seq timesteps
+             X = X[:, -expected_seq:, :]
+ 
+-    return model.predict(X, verbose=0).reshape(-1)
++    return X
+ 
+ 
+ # =============================================================================
+@@ -343,30 +447,31 @@ def _run_realistic(csv_files, args, metadata_dict, language_vocab, seeds):
+     """
+     # Load model for the first seed
+     seed = seeds[0]
+-    model_dir = make_model_dir_name(args.aggregate, args.backs, args.meta, seed)
+-    model_path = os.path.join("models", model_dir, f"{args.model}.keras")
+-
+-    if not os.path.exists(model_path):
+-        print(f"Model not found: {model_path}")
+-        return
+-
+-    print(f"Loading model: {model_path}")
+-    model = tf.keras.models.load_model(model_path, compile=False)
+-    expected_features = model.input_shape[-1]
+-    expected_seq = model.input_shape[1]
++    model_dir = make_model_dir_name(args.aggregate, args.backs, args.meta, seed, args.model_comment)
++    if not args.merge_chunks:
++        fold_models = load_ensemble(model_dir, args.model, args.legacy_last_fold)
++        expected_features = fold_models[0].input_shape[-1]
++        expected_seq = fold_models[0].input_shape[1]
++    lo, hi = (int(x) for x in args.repo_range.split(":")) if args.repo_range else (0, len(csv_files))
+ 
+     # Process repos one at a time to manage memory
+     all_preds = []
++    all_logits = []
+     all_labels = []
++    all_samples_prov = []
+     repos_processed = 0
+     repos_skipped = 0
+     total_vulns = 0
+     total_benigns = 0
+ 
+     for i, csv_path in enumerate(csv_files):
++        if args.merge_chunks or not lo <= i < hi:
++            continue  # --repo-range: another process scores this repo; --merge-chunks: all already scored
++        if args.reload_every and i > 0 and i % args.reload_every == 0:
++            fold_models = reload_ensemble(fold_models, model_dir, args)
+         samples, n_vulns, repo_name = process_repo(
+             csv_path, args.aggregate, args.backs, metadata_dict, language_vocab,
+-            realistic=True,
++            realistic=True, sample_seed=args.sample_seed, benign_commit_only=args.benign_commit_only,
+         )
+         if samples is None or len(samples) == 0:
+             repos_skipped += 1
+@@ -378,8 +483,11 @@ def _run_realistic(csv_files, args, metadata_dict, language_vocab, seeds):
+         n_benign = len(labels) - n_vulns
+ 
+         # Run inference for this repo's windows
+-        pred = _pad_and_predict(model, windows, expected_seq, expected_features)
++        X_repo = _pad_windows(windows, expected_seq, expected_features)
++        pred, logit, _ = (ensemble_predict_padded if args.pad_batches else ensemble_predict)(fold_models, X_repo)
+         all_preds.extend(pred.tolist())
++        all_logits.extend(logit.tolist())
++        all_samples_prov.extend(s[2] for s in samples)  # provenance only, not windows
+         all_labels.extend(labels)
+         total_vulns += n_vulns
+         total_benigns += n_benign
+@@ -390,6 +498,36 @@ def _run_realistic(csv_files, args, metadata_dict, language_vocab, seeds):
+             print(f"  [{i+1}/{len(csv_files)}] {repos_processed} repos, "
+                   f"{total_vulns} vuln + {total_benigns} benign commits so far")
+ 
++    if args.repo_range:  # chunk process: save the raw per-repo results; the merge run reports
++        import pickle
++        with open(args.chunk_out, "wb") as f:
++            pickle.dump({"range": (lo, hi), "csv_files": [os.path.basename(c) for c in csv_files], "preds": all_preds,
++                         "logits": all_logits, "labels": all_labels, "prov": all_samples_prov,
++                         "repos_processed": repos_processed, "repos_skipped": repos_skipped,
++                         "total_vulns": total_vulns, "total_benigns": total_benigns}, f)
++        print(f"[CHUNK] repos {lo}:{hi} of {len(csv_files)}: {repos_processed} processed, {repos_skipped} skipped, "
++              f"{len(all_labels)} samples -> {args.chunk_out}")
++        return
++    if args.merge_chunks:  # same lists, in the same repo order, as one process would have built
++        import pickle
++        chunks = []
++        for path in args.merge_chunks.split(","):
++            with open(path, "rb") as f:
++                chunks.append(pickle.load(f))
++        chunks.sort(key=lambda c: c["range"][0])
++        names = [os.path.basename(c) for c in csv_files]
++        edges = [c["range"] for c in chunks]
++        if edges[0][0] != 0 or edges[-1][1] != len(csv_files) or any(a[1] != b[0] for a, b in zip(edges, edges[1:])) \
++                or any(c["csv_files"] != names for c in chunks):
++            print(f"[MERGE] ERROR: chunks {edges} do not cover repos 0:{len(csv_files)} exactly, or list differs")
++            sys.exit(4)
++        for c in chunks:
++            all_preds += c["preds"]; all_logits += c["logits"]; all_labels += c["labels"]
++            all_samples_prov += c["prov"]
++            repos_processed += c["repos_processed"]; repos_skipped += c["repos_skipped"]
++            total_vulns += c["total_vulns"]; total_benigns += c["total_benigns"]
++        print(f"[MERGE] {len(chunks)} chunks {edges} -> {len(all_labels)} samples")
++
+     print(f"\nProcessed {repos_processed} repos, skipped {repos_skipped}")
+     print(f"Total: {len(all_labels)} samples ({total_vulns} vuln, {total_benigns} benign)")
+     print(f"Imbalance: 1 vuln : {total_benigns / max(total_vulns, 1):.1f} benign")
+@@ -422,9 +560,19 @@ def _run_realistic(csv_files, args, metadata_dict, language_vocab, seeds):
+     print(f"  Mean prob (benign): {pred[y_test == 0].mean():.4f}")
+     print()
+ 
+-    # Threshold sweep: find the optimal operating point for F1
+-    # Tests coarse grid (0.30–0.95 in 0.05 steps) then refines around best
+-    print("=== THRESHOLD SWEEP ===")
++    prov = stack_provenance(all_samples_prov)
++    print(f"[PROVENANCE] {len(prov['repo'])} rows, {int(prov['prov_verified'].sum())} verified, "
++          f"{int((prov['hash'] != '').sum())} with a commit hash")
++    print(f"[COMMIT-LIST] n={len(y_test)} sha256={commit_list_fingerprint(prov, y_test)}")
++    if args.save_preds:
++        np.savez(args.save_preds, scores=pred, logits=np.array(all_logits), labels=y_test.astype(int),
++                 threshold=args.threshold, **prov)
++        print(f"Saved external predictions to {args.save_preds}")
++
++    # Threshold sweep on the EXTERNAL labels. Leakage-free patch: this is kept only
++    # as a diagnostic (it tunes the threshold on the test labels). The reportable
++    # numbers are the ones above, at the fixed/validation threshold.
++    print("=== THRESHOLD SWEEP [DIAGNOSTIC ONLY - tuned on external labels, do not report] ===")
+     print(f"{'Thr':>5} {'Acc':>7} {'Prec':>7} {'Rec':>7} {'F1':>7} {'FPR':>7}  TP     FP     FN")
+     print("-" * 75)
+     best_f1, best_thr = 0, 0.5
+@@ -447,7 +595,7 @@ def _run_realistic(csv_files, args, metadata_dict, language_vocab, seeds):
+         if t_f1 > best_f1:
+             best_f1, best_thr = t_f1, thr
+ 
+-    print(f"\nBest F1: {best_f1:.4f} at threshold={best_thr:.2f}")
++    print(f"\n[DIAGNOSTIC ONLY] Best F1 on external labels: {best_f1:.4f} at threshold={best_thr:.2f}")
+ 
+     # Final summary
+     print()
+@@ -458,9 +606,11 @@ def _run_realistic(csv_files, args, metadata_dict, language_vocab, seeds):
+     print(f"  Imbalance: 1:{total_benigns / max(total_vulns, 1):.1f}")
+     print(f"  ROC-AUC:   {auc:.4f}")
+     print(f"  Avg Prec:  {ap:.4f}")
+-    print(f"  Recall@0.5:    {rec:.4f} (catches {tp} of {total_vulns} vuln commits)")
+-    print(f"  Precision@0.5: {prec:.4f} ({tp} true alerts out of {tp + fp} total alerts)")
+-    print(f"  Best F1: {best_f1:.4f} at threshold={best_thr:.2f}")
++    thr = args.threshold
++    print(f"  [LEAKAGE-FREE] threshold={thr:.2f}  F1={f1:.4f}  Acc={acc:.4f}")
++    print(f"  Recall@{thr:.2f}:    {rec:.4f} (catches {tp} of {total_vulns} vuln commits)")
++    print(f"  Precision@{thr:.2f}: {prec:.4f} ({tp} true alerts out of {tp + fp} total alerts)")
++    print(f"  [DIAGNOSTIC ONLY, tuned on external labels] Best F1: {best_f1:.4f} at threshold={best_thr:.2f}")
+ 
+ 
+ # =============================================================================
+@@ -494,15 +644,59 @@ def main():
+     # Evaluation parameters
+     parser.add_argument("--seed", type=int, default=42)
+     parser.add_argument("--threshold", type=float, default=0.5)
++    # Leakage-free patch: take the decision threshold from the internal validation
++    # pool saved by train.py (results/preds_<exp>_<model>.npz, key tau_val) instead
++    # of choosing it on the external labels.
++    parser.add_argument("--tau-from-npz", type=str, default=None,
++                        help="Read tau_val from a train.py preds .npz and use it as --threshold")
++    parser.add_argument("--save-preds", type=str, default=None,
++                        help="Save external scores+labels to this .npz (re-thresholding without re-running)")
+     parser.add_argument("--all-seeds", action="store_true")
++    parser.add_argument("--benign-commit-only", action="store_true",
++                        help="rerun_v3: benign targets only from Commit events (needs 'commitonly' in --model-comment)")
++    parser.add_argument("--model-comment", default="",
++                        help="rerun_v3: the train.py --comment of the models (e.g. commitonly); seed suffix added as in training")
++    parser.add_argument("--sample-seed", type=int, default=0,
++                        help="RUNBOOK_v2: seed for the per-repo benign sample (balanced mode)")
++    parser.add_argument("--legacy-last-fold", action="store_true",
++                        help="Use only models/<dir>/<model>.keras (pre-RUNBOOK_v2; comparison only)")
+     parser.add_argument("--enriched", action="store_true",
+                         help="Use enriched CSVs from cvefixes_test/enriched/")
++    parser.add_argument("--repo-range", default=None,
++                        help="realistic mode: score only repos A:B (0-based, end excluded) and save the raw results "
++                             "to --chunk-out; a later --merge-chunks run reports (memory fix, runs_v2/NOTES.md s12)")
++    parser.add_argument("--chunk-out", default=None, help="output .pkl for --repo-range")
++    parser.add_argument("--merge-chunks", default=None,
++                        help="realistic mode: comma-separated --chunk-out files; no scoring, the results are joined in "
++                             "repo order and reported exactly as a single run")
++    parser.add_argument("--reload-every", type=int, default=0,
++                        help="realistic mode: reload the fold models every N repos to free compiled GPU programs "
++                             "(memory fix, runs_v2/NOTES.md s11); scores unchanged; 0 = never")
++    parser.add_argument("--pad-batches", action="store_true",
++                        help="realistic mode: pad each repo's windows to a multiple of 256 rows so the GPU compiles "
++                             "each model once (memory fix, runs_v2/NOTES.md s9); padded rows are dropped")
+     parser.add_argument("--realistic", action="store_true",
+                         help="Test on ALL commits (natural imbalance, no 1:1 sampling)")
+     parser.add_argument("--exclude-train-overlap", action="store_true",
+                         help="Drop CVEfixes test repos whose flat name (case-insensitive) "
+                              "matches any training repo CSV in data_collection/gh_cve_proccessed/.")
+     args = parser.parse_args()
++    # rerun_v3 (Commit-only benign targets): Commit-only models and Commit-only targets always go together
++    if args.benign_commit_only != ("commitonly" in args.model_comment):
++        print(f"FATAL: --benign-commit-only={args.benign_commit_only} but --model-comment={args.model_comment!r}")
++        sys.exit(2)
++    if args.benign_commit_only:
++        print(f"[COMMIT-ONLY] benign targets restricted to Commit events; models from *_{args.model_comment}*")
++
++    if args.tau_from_npz:
++        if not os.path.exists(args.tau_from_npz):
++            print(f"FATAL: --tau-from-npz file not found: {args.tau_from_npz}")
++            sys.exit(2)
++        args.threshold = float(np.load(args.tau_from_npz)["tau_val"])
++        print(f"[LEAKAGE-FREE] threshold = tau_val = {args.threshold:.4f} "
++              f"(selected on internal validation, from {args.tau_from_npz})")
++    else:
++        print(f"[THRESHOLD] fixed threshold = {args.threshold:.2f} (not tuned on external labels)")
+ 
+     # Select seeds: all 5 experimental seeds or just the specified one
+     seeds = [42, 123, 7, 256, 999] if args.all_seeds else [args.seed]
+@@ -622,6 +816,7 @@ def main():
+     for csv_path in csv_files:
+         samples, n_vulns, repo_name = process_repo(
+             csv_path, args.aggregate, args.backs, metadata_dict, language_vocab,
++            sample_seed=args.sample_seed, benign_commit_only=args.benign_commit_only,
+         )
+         if samples is None or len(samples) == 0:
+             repos_skipped += 1
+@@ -633,8 +828,8 @@ def main():
+         logger.info(f"  {repo_name}: {n_vulns} vuln + {len(samples) - n_vulns} benign windows")
+ 
+     print(f"\nProcessed {repos_processed} repos, skipped {repos_skipped}")
+-    n_vuln_samples = sum(1 for _, l in all_samples if l == 1)
+-    n_benign_samples = sum(1 for _, l in all_samples if l == 0)
++    n_vuln_samples = sum(1 for s in all_samples if s[1] == 1)
++    n_benign_samples = sum(1 for s in all_samples if s[1] == 0)
+     print(f"Total samples: {len(all_samples)} ({n_vuln_samples} vuln, {n_benign_samples} benign)")
+ 
+     if not all_samples:
+@@ -659,6 +854,11 @@ def main():
+     y_test = np.array(labels, dtype=np.float32)
+ 
+     print(f"Test array shape: {X_test.shape}")
++    prov = stack_provenance([s[2] for s in all_samples])
++    print(f"[PROVENANCE] {len(prov['repo'])} rows, {int(prov['prov_verified'].sum())} verified, "
++          f"{int((prov['hash'] != '').sum())} with a commit hash")
++    print(f"[COMMIT-LIST] n={len(y_test)} vuln={n_vuln_samples} benign={n_benign_samples} "
++          f"sha256={commit_list_fingerprint(prov, y_test)}")
+     print()
+ 
+     # ---- Run inference for each seed ----
+@@ -666,17 +866,10 @@ def main():
+ 
+     for seed in seeds:
+         # Locate the model checkpoint for this seed
+-        model_dir = make_model_dir_name(args.aggregate, args.backs, args.meta, seed)
+-        model_path = os.path.join("models", model_dir, f"{args.model}.keras")
+-
+-        if not os.path.exists(model_path):
+-            print(f"Model not found: {model_path} — skipping seed {seed}")
+-            continue
+-
++        model_dir = make_model_dir_name(args.aggregate, args.backs, args.meta, seed, args.model_comment)
+         print(f"--- Seed {seed} ---")
+-        print(f"Loading: {model_path}")
+-
+-        model = tf.keras.models.load_model(model_path, compile=False)
++        fold_models = load_ensemble(model_dir, args.model, args.legacy_last_fold)
++        model = fold_models[0]  # only used for input-shape checks below
+ 
+         # Handle feature dimensionality mismatch between test data and model.
+         # This can occur if test repos have different metadata/language features.
+@@ -703,7 +896,7 @@ def main():
+                 X_eval = X_eval[:, -expected_seq:, :]
+ 
+         # Run model inference and binarise at threshold
+-        pred = model.predict(X_eval, verbose=0).reshape(-1)
++        pred, logit, pred_folds = ensemble_predict(fold_models, X_eval)
+         y_pred = (pred >= args.threshold).astype(int)
+ 
+         # Compute standard classification metrics
+@@ -718,11 +911,24 @@ def main():
+         print(f"  Recall:    {rec:.4f}")
+         print(f"  F1 Score:  {f1:.4f}")
+         print(f"  Confusion: TN={tn} FP={fp} FN={fn} TP={tp}")
++        if n_benign_samples > 0 and n_vuln_samples > 0:
++            # Threshold-free, so unaffected by threshold choice
++            print(f"  ROC-AUC:   {roc_auc_score(y_test, pred):.4f}")
++            print(f"  Avg Precision (AP): {average_precision_score(y_test, pred):.4f}")
++        if args.save_preds:
++            out = args.save_preds if len(seeds) == 1 else args.save_preds.replace(".npz", f"_s{seed}.npz")
++            np.savez(out, scores=pred, logits=logit, pred_folds=pred_folds, labels=y_test.astype(int),
++                     threshold=args.threshold, **prov)
++            print(f"  Saved external predictions to {out}")
+         print(f"  Mean prob (vuln):   {pred[y_test == 1].mean():.4f}")
+         if n_benign_samples > 0:
+             print(f"  Mean prob (benign): {pred[y_test == 0].mean():.4f}")
+         print()
+ 
++        auc_v = roc_auc_score(y_test, pred) if n_benign_samples and n_vuln_samples else float("nan")
++        ap_v = average_precision_score(y_test, pred) if n_benign_samples and n_vuln_samples else float("nan")
++        print(f"[RESULT] seed={seed} n={len(y_test)} tau={args.threshold:.4f} acc={acc:.4f} prec={prec:.4f} "
++              f"rec={rec:.4f} f1={f1:.4f} roc_auc={auc_v:.4f} ap={ap_v:.4f}")
+         all_results.append({
+             "seed": seed, "acc": acc, "prec": prec, "rec": rec, "f1": f1,
+             "tn": tn, "fp": fp, "fn": fn, "tp": tp,
+@@ -735,7 +941,8 @@ def main():
+         f1s = [r["f1"] for r in all_results]
+         recs = [r["rec"] for r in all_results]
+         print("=" * 60)
+-        print(f"SUMMARY (BALANCED 1:1): {args.model} | {args.aggregate.value} | B={args.backs} | meta={args.meta}")
++        print(f"SUMMARY (BALANCED 1:1): {args.model} | {args.aggregate.value} | B={args.backs} | meta={args.meta}"
++              f" | threshold={args.threshold:.2f}{' (tau_val)' if args.tau_from_npz else ''}")
+         print(f"  Seeds evaluated: {len(all_results)}")
+         print(f"  Accuracy:  {np.mean(accs):.4f} +/- {np.std(accs):.4f}")
+         print(f"  Precision: {np.mean(precs):.4f} +/- {np.std(precs):.4f}")
+diff --git a/generate_attention_perhead.py b/generate_attention_perhead.py
+index a12364b..f858159 100644
+--- a/generate_attention_perhead.py
++++ b/generate_attention_perhead.py
+@@ -13,13 +13,13 @@ sys.path.insert(0, '.')
+ from models import CenterTokenPooling, LastTokenPooling, PaddingMask
+ from dataset_utils import extract_dataset, pad_and_fix, split_repos, split_into_x_and_y, Aggregate
+ 
+-MODEL_PATH = "models/Aggregate.before_cve_R1_B20_meta/transformer.keras"
++MODEL_PATH = "models/Aggregate.before_cve_R1_B20_meta_s999/transformer.keras"
+ model = tf.keras.models.load_model(MODEL_PATH, custom_objects={
+     'CenterTokenPooling': CenterTokenPooling, 'LastTokenPooling': LastTokenPooling, 'PaddingMask': PaddingMask,
+ })
+ seq_len = model.input_shape[1]
+ 
+-np.random.seed(42); tf.random.set_seed(42); random.seed(42); os.environ['PYTHONHASHSEED']='42'
++np.random.seed(999); tf.random.set_seed(999); random.seed(999); os.environ['PYTHONHASHSEED']='999'
+ all_repos, _, columns = extract_dataset(aggr_options=Aggregate.before_cve, backs=20, metadata=True, cache=True)
+ all_repos, num_vulns = pad_and_fix(all_repos)
+ _, test_repos, _ = split_repos(all_repos, int(0.8*num_vulns)+int(0.1*num_vulns))
+@@ -86,7 +86,7 @@ for h in range(num_heads):
+         ax_bot.set_ylabel('Query position')
+     plt.colorbar(im2, ax=ax_bot, fraction=0.046, pad=0.04)
+ 
+-plt.suptitle('Per-Head Attention Patterns (Layer 1, B=20 Symmetric, Seed 42)\n'
++plt.suptitle('Per-Head Attention Patterns (Layer 1, B=20 Symmetric, Seed 999)\n'
+              'Top: Vulnerable samples | Bottom: Difference (Vulnerable − Benign, red = more attention for vulnerable)',
+              fontsize=13, y=1.01)
+ plt.tight_layout()
+diff --git a/run_cvefixes_windows.sh b/run_cvefixes_windows.sh
+index 27ea41d..64ba6a0 100755
+--- a/run_cvefixes_windows.sh
++++ b/run_cvefixes_windows.sh
+@@ -1,10 +1,18 @@
+ #!/bin/bash
+ # Run all window configurations on CVEfixes enriched data (seed 42 only)
+ # 4 window sizes x 2 aggregations x 2 models = 16 runs
++#
++# LEAKAGE-FREE version (rerun 2026-11): each config is scored at tau_val, the
++# threshold selected on train.py's pooled internal validation predictions
++# (results/preds_<exp>_<model>.npz). Nothing is tuned on the external labels.
++# Requires the seed-42 train.py run for every (model, agg, B) to exist first.
++# The original March output (cvefixes_window_results.txt) is left untouched.
+ 
+-LOG="cvefixes_window_results.txt"
++OUTDIR=rerun_logs/external
++mkdir -p "$OUTDIR"
++LOG="$OUTDIR/cvefixes_window_results_leakage_free.txt"
+ echo "================================================================================" > "$LOG"
+-echo "CVEfixes Window Configuration Sweep" >> "$LOG"
++echo "CVEfixes Window Configuration Sweep (LEAKAGE-FREE: threshold = tau_val)" >> "$LOG"
+ echo "Date: $(date)" >> "$LOG"
+ echo "Seed: 42 (single trained model per config)" >> "$LOG"
+ echo "Data: Enriched CVEfixes (212 repos, ~2404 samples)" >> "$LOG"
+@@ -13,16 +21,24 @@ echo "" >> "$LOG"
+ 
+ for MODEL in transformer conv1d; do
+   for AGG in before only_before; do
++    if [ "$AGG" = "before" ]; then AGGNAME=before_cve; WIN=sym; else AGGNAME=only_before; WIN=causal; fi
+     for BACKS in 5 10 20 40; do
+-      echo "--- Running: $MODEL | $AGG | B=$BACKS ---"
++      NPZ="results/preds_Aggregate.${AGGNAME}_R1_B${BACKS}_meta_${MODEL}.npz"
++      RAW="$OUTDIR/enriched_${MODEL}_${WIN}_b${BACKS}_s42.log"
++      echo "[$(date +%H:%M:%S)] --- Running: $MODEL | $AGG | B=$BACKS (tau from $NPZ) -> $RAW ---"
+       echo "================================================================================" >> "$LOG"
+       echo "MODEL=$MODEL | AGG=$AGG | BACKS=$BACKS" >> "$LOG"
+       echo "================================================================================" >> "$LOG"
+-      python -u evaluate_cvefixes.py -a "$AGG" --model "$MODEL" --backs "$BACKS" --meta --seed 42 --enriched 2>&1 | \
+-        tee -a /tmp/cvefixes_raw_output.txt | \
+-        grep -v "PerformanceWarning\|frame.insert\|newframe\|cur_repo\|tensorflow/core\|^ *$\|INFO " >> "$LOG"
++      if [ ! -f "$NPZ" ]; then
++        echo "FATAL: missing $NPZ (run train.py for this config first)" | tee -a "$LOG"
++        continue
++      fi
++      python3 -u evaluate_cvefixes.py -a "$AGG" --model "$MODEL" --backs "$BACKS" --meta --seed 42 --enriched \
++          --tau-from-npz "$NPZ" --save-preds "$OUTDIR/extpreds_enriched_${MODEL}_${WIN}_b${BACKS}_s42.npz" \
++          > "$RAW" 2>&1
++      grep -v "PerformanceWarning\|frame.insert\|newframe\|cur_repo\|tensorflow/core\|^ *$\|INFO " "$RAW" >> "$LOG"
+       echo "" >> "$LOG"
+-      echo "--- Done: $MODEL | $AGG | B=$BACKS ---"
++      echo "[$(date +%H:%M:%S)] --- Done: $MODEL | $AGG | B=$BACKS ---"
+     done
+   done
+ done
+diff --git a/run_unseen_sweep.sh b/run_unseen_sweep.sh
+index 9a63587..9e9de8e 100755
+--- a/run_unseen_sweep.sh
++++ b/run_unseen_sweep.sh
+@@ -3,23 +3,35 @@
+ # (case-insensitive dedup against training set).
+ # Mirrors the original tab:external-comparison: seed 42, transformer + conv1d,
+ # sym + causal, B = 5/10/20/40.
++#
++# LEAKAGE-FREE version (rerun 2026-11): threshold = tau_val from train.py's pooled
++# internal validation (results/preds_<exp>_<model>.npz), not tuned on external labels.
++# Uses the miniconda python3 (TF 2.21, same as training) instead of venv (TF 2.20).
+ 
+ set -u
+-mkdir -p logs
+-OUT=logs/cvefixes_unseen_window_sweep.txt
++OUTDIR=rerun_logs/external
++mkdir -p "$OUTDIR"
++OUT="$OUTDIR/cvefixes_unseen_window_sweep_leakage_free.txt"
+ : > "$OUT"
+ 
+-source venv/bin/activate
+-
+ for ARCH in transformer conv1d; do
+   for AGG in before only_before; do
++    if [ "$AGG" = "before" ]; then AGGNAME=before_cve; WIN=sym; else AGGNAME=only_before; WIN=causal; fi
+     for B in 5 10 20 40; do
++      NPZ="results/preds_Aggregate.${AGGNAME}_R1_B${B}_meta_${ARCH}.npz"
++      RAW="$OUTDIR/unseen_${ARCH}_${WIN}_b${B}_s42.log"
+       echo "================================================================================" | tee -a "$OUT"
+       echo "MODEL=$ARCH | AGG=$AGG | BACKS=$B" | tee -a "$OUT"
+       echo "================================================================================" | tee -a "$OUT"
+-      python evaluate_cvefixes.py -a "$AGG" --model "$ARCH" --backs "$B" \
+-          --meta --enriched --exclude-train-overlap --seed 42 2>&1 \
+-        | grep -E "(Accuracy|Precision|Recall|F1 Score|Confusion|Excluded|Remaining|Test samples|Test repos|Total samples|^---|FATAL|ERROR|Loading)" \
++      if [ ! -f "$NPZ" ]; then
++        echo "FATAL: missing $NPZ (run train.py for this config first)" | tee -a "$OUT"
++        continue
++      fi
++      python3 -u evaluate_cvefixes.py -a "$AGG" --model "$ARCH" --backs "$B" \
++          --meta --enriched --exclude-train-overlap --seed 42 \
++          --tau-from-npz "$NPZ" --save-preds "$OUTDIR/extpreds_unseen_${ARCH}_${WIN}_b${B}_s42.npz" \
++          > "$RAW" 2>&1
++      grep -E "(LEAKAGE-FREE|THRESHOLD|Accuracy|Precision|Recall|F1 Score|ROC-AUC|Avg Precision|Confusion|Excluded|Remaining|Test samples|Test repos|Total samples|^---|FATAL|ERROR|Loading|SUMMARY)" "$RAW" \
+         | tee -a "$OUT"
+       echo "" | tee -a "$OUT"
+     done
+diff --git a/train.py b/train.py
+index d87b886..3c384e4 100644
+--- a/train.py
++++ b/train.py
+@@ -43,6 +43,7 @@ import sys
+ import logging
+ import math
+ import random
++import json
+ 
+ import coloredlogs
+ import numpy as np
+@@ -61,6 +62,8 @@ from dataset_utils import (
+     split_into_x_and_y,
+ )
+ from helper import find_best_accuracy, find_best_f1, EnumAction, safe_mkdir
++from model_outputs import predict_logits          # RUNBOOK_v2 s3: pre-sigmoid logits
++from provenance import recover, repo_details       # RUNBOOK_v2 s3: repo + hash per row
+ 
+ logger = logging.getLogger(__name__)
+ coloredlogs.install(fmt="%(asctime)s %(levelname)s %(message)s")
+@@ -567,6 +570,7 @@ def train_model(
+             "GatherFeatures": models.GatherFeatures,
+             "ExtractStatic": models.ExtractStatic,
+         },
++        compile=False
+     )
+ 
+ 
+@@ -574,7 +578,7 @@ def train_model(
+ # check_results — Evaluation and reporting
+ # =============================================================================
+ 
+-def check_results(X_test, y_test, pred, exp_name, model_name, save=False):
++def check_results(X_test, y_test, pred, exp_name, model_name, save=True):
+     """Evaluate predictions via threshold sweep and optionally save results.
+ 
+     Uses find_best_f1() and find_best_accuracy() to sweep 100 thresholds
+@@ -688,6 +692,8 @@ def parse_args():
+     parser.add_argument("-m", "--model", action="store", type=str, default="conv1d")
+     parser.add_argument("-k", "--kfold", type=int, default=10)
+     parser.add_argument("--comment", action="store", type=str, default="")
++    parser.add_argument("--benign-commit-only", action="store_true",
++                        help="rerun_v3: draw benign targets only from Commit events (needs 'commitonly' in --comment)")
+     parser.add_argument("--batch", type=int, default=32)
+     parser.add_argument("--metadata", action="store_true")
+     parser.add_argument("--data-location", action="store", default="data_collection")
+@@ -751,6 +757,18 @@ def parse_args():
+         default=42,
+         help="random seed for reproducibility (default: 42)",
+     )
++    # RUNBOOK_v2 Task 3 ablation (ablation.py). Off by default: without it nothing below changes.
++    parser.add_argument(
++        "--ablate",
++        choices=["no_new", "no_graphql", "no_temporal"],
++        default=None,
++        help="remove a feature group after loading (needs --columns-file); outputs get an _ablate-<group> suffix",
++    )
++    parser.add_argument(
++        "--columns-file",
++        default=None,
++        help="VERIFIED column list for this cache (runs_v2/03_feature_check/reconstruct_and_verify_columns.py)",
++    )
+     return parser.parse_args()
+ 
+ 
+@@ -856,12 +874,24 @@ def main():
+         comment=comment,
+         data_location=args.data_location,
+         cache_location=args.cache_location,
++        benign_commit_only=args.benign_commit_only,
+     )
+ 
+     # ---- Step 2: Global padding ----
+     # Pad all repos' windows to the same sequence length across the dataset
+     all_repos, num_of_vulns = pad_and_fix(all_repos)
+ 
++    # RUNBOOK_v2 Task 3 ablation: remove one feature group (no RNG use, so the split is unchanged).
++    if args.ablate:
++        from ablation import read_verified_columns, drop_feature_group
++        if not args.columns_file:
++            raise SystemExit("--ablate needs --columns-file")
++        verified = read_verified_columns(args.columns_file, os.path.join(args.cache_location, exp_name))
++        kept = drop_feature_group(all_repos, args.ablate, verified)
++        logger.critical(f"[ABLATION] {args.ablate}: removed {len(verified) - len(kept)} of {len(verified)} "
++                        f"features, {len(kept)} kept (columns from {args.columns_file})")
++        exp_name = f"{exp_name}_ablate-{args.ablate}"
++
+     # ---- Step 3: Train/val/test split by vuln count ----
+     # 80% train, 10% validation, 10% test (measured by vuln sample count)
+     train_size = int(0.8 * num_of_vulns)
+@@ -877,6 +907,10 @@ def main():
+     X_all, y_all = split_into_x_and_y(train_and_val_repos)
+     # Build group labels so GroupKFold keeps each repo in one fold only
+     groups = build_group_labels(train_and_val_repos)
++    # RUNBOOK_v2 s3: provenance tuples aligned row-for-row with X_all / y_all
++    details_all = repo_details(train_and_val_repos)
++    if len(details_all) != len(y_all):
++        raise RuntimeError(f"provenance rows {len(details_all)} != samples {len(y_all)}")
+ 
+     # ---- Step 4: GroupKFold cross-validation ----
+     # Limit folds to available repos (if fewer repos than k)
+@@ -887,6 +921,12 @@ def main():
+     best_val_accuracy = 0
+     fold_models = []       # All fold models for ensemble
+     fold_accuracies = []   # Val accuracy per fold
++    val_pred_pool = []     # ADD (leakage-free patch): pooled val preds across folds
++    val_y_pool = []        # ADD (leakage-free patch): pooled val labels across folds
++    val_fold_pool = []     # RUNBOOK_v2 s3: fold index (0-9) for every pooled val row
++    val_idx_pool = []      # RUNBOOK_v2 s3: X_all row index for every pooled val row
++    fold_model_dir = os.path.join("models", exp_name, f"{args.model}_folds")
++    os.makedirs(fold_model_dir, exist_ok=True)
+     fold = 0
+ 
+     for train_idx, val_idx in gkf.split(X_all, y_all, groups):
+@@ -920,16 +960,25 @@ def main():
+         )
+ 
+         fold_models.append(model)
++        # RUNBOOK_v2 s3: keep every fold model (not only the last checkpoint)
++        model.save(os.path.join(fold_model_dir, f"fold_{fold - 1}.keras"))
+ 
+         # Evaluate this fold's model on its validation set
+         pred = model.predict(X_val, verbose=0).reshape(-1)
+         acc = check_results(X_val, y_val, pred, exp_name, args.model)
+         fold_accuracies.append(acc)
++        val_pred_pool.append(pred)              # ADD (leakage-free patch)
++        val_y_pool.append(np.asarray(y_val))    # ADD (leakage-free patch)
++        val_fold_pool.append(np.full(len(val_idx), fold - 1, dtype=np.int64))  # RUNBOOK_v2 s3
++        val_idx_pool.append(np.asarray(val_idx))                                # RUNBOOK_v2 s3
+ 
+         # Track the best single model across all folds
+         if acc > best_val_accuracy:
+             best_model = model
+             best_val_accuracy = acc
++    
++    with open(f"fold_accuracies_{exp_name}_{args.model}_{args.aggr.name}.json", "w") as f:
++        json.dump(fold_accuracies, f)
+ 
+     if best_model is None:
+         raise RuntimeError("No model was successfully trained.")
+@@ -939,22 +988,81 @@ def main():
+ 
+     # Ensemble prediction: average predictions from ALL k fold models.
+     # This reduces variance and typically outperforms any single model.
++    # (Accumulation kept exactly as before so ensemble_pred is bit-identical;
++    #  RUNBOOK_v2 s3 additionally keeps each fold's probabilities and logits.)
+     ensemble_pred = np.zeros(len(y_test), dtype=np.float32)
++    test_pred_folds = []
++    test_logit_folds = []
+     for m in fold_models:
+-        ensemble_pred += m.predict(X_test, verbose=0).reshape(-1)
++        fold_pred = m.predict(X_test, verbose=0).reshape(-1)
++        ensemble_pred += fold_pred
++        test_pred_folds.append(fold_pred)
++        test_logit_folds.append(predict_logits(m, X_test))
+     ensemble_pred /= len(fold_models)
++    test_pred_folds = np.stack(test_pred_folds)              # (n_folds, n_test)
++    test_logit = np.stack(test_logit_folds).mean(axis=0)     # ensemble mean logit
+ 
+     # Report both single-best and ensemble results
+     logging.critical(f"Best val accuracy: {best_val_accuracy}")
+ 
+     # Single best model evaluation (the model with highest fold val accuracy)
+     pred_single = best_model.predict(X_test, verbose=0).reshape(-1)
+-    acc_single = check_results(X_test, y_test, pred_single, exp_name, args.model)
+-    logging.critical(f"Single best test accuracy: {acc_single}")
+ 
+-    # Ensemble evaluation (save=True writes results file and ROC plot)
++    # ---- LEAKAGE-FREE PATCH ----
++    # (os and numpy already imported at module scope; do NOT re-import here —
++    # a function-scope `import` makes the name local for the entire function
++    # and shadows the module-level binding earlier in the function body.)
++    from leakage_free_eval import leakage_free_report
++    # OLD, biased, kept only for transparency (threshold swept on test):
++    acc_single = check_results(X_test, y_test, pred_single, exp_name, args.model)
++    logging.critical(f"[OPTIMISTIC, threshold-on-test] single best acc: {acc_single}")
++
++    # CORRECTED: threshold selected on pooled validation, applied to test.
++    val_pred_all = np.concatenate(val_pred_pool)
++    val_y_all = np.concatenate(val_y_pool)
++    rep = leakage_free_report(val_pred_all, val_y_all, ensemble_pred, y_test,
++                              metric_for_threshold="f1")
++    c = rep["corrected"]
++    logging.critical(
++        f"[LEAKAGE-FREE] tau(val)={rep['tau_val']:.2f} "
++        f"acc={c['accuracy']:.4f} f1={c['f1']:.4f} "
++        f"roc_auc={c['roc_auc']:.4f} ap={c['avg_precision']:.4f}")
++    logging.critical(
++        f"[INFLATION] accuracy +{rep['accuracy_inflation']*100:.2f}pp, "
++        f"f1 +{rep['f1_inflation']*100:.2f}pp from test-set thresholding")
++
++    # Save per-commit predictions so re-thresholding never needs a retrain.
++    # RUNBOOK_v2 s3: provenance (repo, commit hash) for every test and val row.
++    val_idx_all = np.concatenate(val_idx_pool)
++    prov_trainval = recover(details_all, args.data_location)
++    prov_test = recover(repo_details(test_repos), args.data_location)
++    if len(prov_test.repo) != len(y_test):
++        raise RuntimeError(f"test provenance rows {len(prov_test.repo)} != {len(y_test)}")
++    logging.critical(f"[PROVENANCE] test: {prov_test.summary()}")
++    logging.critical(f"[PROVENANCE] train+val: {prov_trainval.summary()}")
++
++    os.makedirs("results", exist_ok=True)
++    np.savez(f"results/preds_{exp_name}_{args.model}.npz",
++             test_pred=ensemble_pred, test_y=np.asarray(y_test),
++             val_pred=val_pred_all, val_y=val_y_all, tau_val=rep["tau_val"],
++             # RUNBOOK_v2 s3 keys
++             test_logit=test_logit,
++             test_pred_folds=test_pred_folds,
++             val_fold=np.concatenate(val_fold_pool),
++             test_repo=prov_test.repo, test_hash=prov_test.hash,
++             val_repo=prov_trainval.repo[val_idx_all], val_hash=prov_trainval.hash[val_idx_all],
++             # extra provenance (not requested; kept for auditing)
++             test_event_type=prov_test.event_type, test_created_at=prov_test.created_at,
++             test_event_idx=prov_test.event_idx, test_prov_verified=prov_test.verified,
++             val_event_type=prov_trainval.event_type[val_idx_all],
++             val_created_at=prov_trainval.created_at[val_idx_all],
++             val_event_idx=prov_trainval.event_idx[val_idx_all],
++             val_prov_verified=prov_trainval.verified[val_idx_all],
++             val_row_index=val_idx_all)
++
++    # Ensemble evaluation (save=True writes results file and ROC plot — kept for continuity)
+     acc_ensemble = check_results(X_test, y_test, ensemble_pred, exp_name, args.model, save=True)
+-    logging.critical(f"Ensemble test accuracy ({len(fold_models)} models): {acc_ensemble}")
++    logging.critical(f"[OPTIMISTIC, threshold-on-test] ensemble ({len(fold_models)} models) acc: {acc_ensemble}")
+ 
+ 
+ if __name__ == "__main__":

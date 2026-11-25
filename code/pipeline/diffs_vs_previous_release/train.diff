@@ -1,0 +1,19 @@
+--- rerun_v3/01_code_changes/originals/train.py	2026-11-14 12:00:17.660819174 +0000
++++ train.py	2026-11-20 20:41:13.684894268 +0000
+@@ -692,6 +692,8 @@
+     parser.add_argument("-m", "--model", action="store", type=str, default="conv1d")
+     parser.add_argument("-k", "--kfold", type=int, default=10)
+     parser.add_argument("--comment", action="store", type=str, default="")
++    parser.add_argument("--benign-commit-only", action="store_true",
++                        help="rerun_v3: draw benign targets only from Commit events (needs 'commitonly' in --comment)")
+     parser.add_argument("--batch", type=int, default=32)
+     parser.add_argument("--metadata", action="store_true")
+     parser.add_argument("--data-location", action="store", default="data_collection")
+@@ -872,6 +874,7 @@
+         comment=comment,
+         data_location=args.data_location,
+         cache_location=args.cache_location,
++        benign_commit_only=args.benign_commit_only,
+     )
+ 
+     # ---- Step 2: Global padding ----

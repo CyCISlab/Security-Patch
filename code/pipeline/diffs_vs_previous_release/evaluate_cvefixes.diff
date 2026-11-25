@@ -1,0 +1,121 @@
+--- rerun_v3/01_code_changes/originals/evaluate_cvefixes.py	2026-11-15 10:41:06.595132963 +0000
++++ evaluate_cvefixes.py	2026-11-20 20:41:54.235407093 +0000
+@@ -85,7 +85,7 @@
+ # Model path helper
+ # =============================================================================
+ 
+-def make_model_dir_name(aggr, backs, metadata, seed=42):
++def make_model_dir_name(aggr, backs, metadata, seed=42, comment=""):
+     """Construct the model checkpoint directory name from training parameters.
+ 
+     Must match the naming convention used by train.py so we load the correct
+@@ -104,6 +104,8 @@
+     name = f"{aggr}_R1_B{backs}"
+     if metadata:
+         name += "_meta"
++    if comment:  # rerun_v3 (Commit-only benign targets): same order as train.py / make_new_dir_name
++        name += f"_{comment}"
+     if seed != 42:
+         name += f"_s{seed}"
+     return name
+@@ -191,8 +193,9 @@
+ # =============================================================================
+ 
+ def process_repo(csv_path, aggr_options, backs, metadata_dict, language_vocab,
+-                 benign_vuln_ratio=1, realistic=False, sample_seed=0):
++                 benign_vuln_ratio=1, realistic=False, sample_seed=0, benign_commit_only=False):
+     """Load a repo CSV and extract event windows for vuln + benign commits.
++    rerun_v3: benign_commit_only=True keeps only Commit events as benign targets (balanced and realistic).
+ 
+     Applies the same feature engineering pipeline as the training data:
+     metadata enrichment → GraphQL features → fix_repo_shape() → window extraction.
+@@ -279,6 +282,10 @@
+     # Add GraphQL recency/churn features (7 columns)
+     cur_repo = add_graphql_features(cur_repo, CVEFIXES_DIR, repo_name)
+ 
++    # rerun_v3 (Commit-only benign targets): row marker before fix_repo_shape drops "type"; not a feature
++    if benign_commit_only:
++        cur_repo["_target_is_commit"] = (cur_repo["type"].astype(str) == "Commit").astype(float)
++
+     # Feature engineering: derive 16 temporal features + z-score normalisation
+     all_set = set()
+     cur_repo = fix_repo_shape(all_set, cur_repo, metadata=use_metadata)
+@@ -289,12 +296,16 @@
+         logger.info(f"Skipping {repo_name}: no vuln commits after processing")
+         return None, None, repo_name
+ 
++    benign_mask = cur_repo["Vuln"] == 0
++    if benign_commit_only:  # rerun_v3 (Commit-only benign targets): candidates restricted to Commit events
++        benign_mask = benign_mask & (cur_repo["_target_is_commit"] == 1)
++        cur_repo = cur_repo.drop(["_target_is_commit"], axis=1)
+     if realistic:
+         # REALISTIC mode: test on ALL non-vuln commits (natural class imbalance)
+-        benigns = cur_repo.index[cur_repo["Vuln"] == 0].tolist()
++        benigns = cur_repo.index[benign_mask].tolist()
+     else:
+         # BALANCED mode: sample benign commits at the specified ratio
+-        benigns = cur_repo.index[cur_repo["Vuln"] == 0].tolist()
++        benigns = cur_repo.index[benign_mask].tolist()
+         # RUNBOOK_v2: fixed, per-repo seeded sample so the external commit list is
+         # identical across every seed/model/mode (previously unseeded random.shuffle).
+         random.Random(f"{sample_seed}:{repo_name}").shuffle(benigns)
+@@ -436,7 +447,7 @@
+     """
+     # Load model for the first seed
+     seed = seeds[0]
+-    model_dir = make_model_dir_name(args.aggregate, args.backs, args.meta, seed)
++    model_dir = make_model_dir_name(args.aggregate, args.backs, args.meta, seed, args.model_comment)
+     if not args.merge_chunks:
+         fold_models = load_ensemble(model_dir, args.model, args.legacy_last_fold)
+         expected_features = fold_models[0].input_shape[-1]
+@@ -460,7 +471,7 @@
+             fold_models = reload_ensemble(fold_models, model_dir, args)
+         samples, n_vulns, repo_name = process_repo(
+             csv_path, args.aggregate, args.backs, metadata_dict, language_vocab,
+-            realistic=True, sample_seed=args.sample_seed,
++            realistic=True, sample_seed=args.sample_seed, benign_commit_only=args.benign_commit_only,
+         )
+         if samples is None or len(samples) == 0:
+             repos_skipped += 1
+@@ -641,6 +652,10 @@
+     parser.add_argument("--save-preds", type=str, default=None,
+                         help="Save external scores+labels to this .npz (re-thresholding without re-running)")
+     parser.add_argument("--all-seeds", action="store_true")
++    parser.add_argument("--benign-commit-only", action="store_true",
++                        help="rerun_v3: benign targets only from Commit events (needs 'commitonly' in --model-comment)")
++    parser.add_argument("--model-comment", default="",
++                        help="rerun_v3: the train.py --comment of the models (e.g. commitonly); seed suffix added as in training")
+     parser.add_argument("--sample-seed", type=int, default=0,
+                         help="RUNBOOK_v2: seed for the per-repo benign sample (balanced mode)")
+     parser.add_argument("--legacy-last-fold", action="store_true",
+@@ -666,6 +681,12 @@
+                         help="Drop CVEfixes test repos whose flat name (case-insensitive) "
+                              "matches any training repo CSV in data_collection/gh_cve_proccessed/.")
+     args = parser.parse_args()
++    # rerun_v3 (Commit-only benign targets): Commit-only models and Commit-only targets always go together
++    if args.benign_commit_only != ("commitonly" in args.model_comment):
++        print(f"FATAL: --benign-commit-only={args.benign_commit_only} but --model-comment={args.model_comment!r}")
++        sys.exit(2)
++    if args.benign_commit_only:
++        print(f"[COMMIT-ONLY] benign targets restricted to Commit events; models from *_{args.model_comment}*")
+ 
+     if args.tau_from_npz:
+         if not os.path.exists(args.tau_from_npz):
+@@ -795,7 +816,7 @@
+     for csv_path in csv_files:
+         samples, n_vulns, repo_name = process_repo(
+             csv_path, args.aggregate, args.backs, metadata_dict, language_vocab,
+-            sample_seed=args.sample_seed,
++            sample_seed=args.sample_seed, benign_commit_only=args.benign_commit_only,
+         )
+         if samples is None or len(samples) == 0:
+             repos_skipped += 1
+@@ -845,7 +866,7 @@
+ 
+     for seed in seeds:
+         # Locate the model checkpoint for this seed
+-        model_dir = make_model_dir_name(args.aggregate, args.backs, args.meta, seed)
++        model_dir = make_model_dir_name(args.aggregate, args.backs, args.meta, seed, args.model_comment)
+         print(f"--- Seed {seed} ---")
+         fold_models = load_ensemble(model_dir, args.model, args.legacy_last_fold)
+         model = fold_models[0]  # only used for input-shape checks below

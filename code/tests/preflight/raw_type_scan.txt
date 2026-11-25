@@ -1,0 +1,5 @@
+parquet files: 2656; repos with >=1 vulnerable event: 1085
+vulnerable events by type: {'Commit': 2886}
+all event types in raw data: {'Commit': 11258762, 'stargazers': 9832470, 'IssueCommentEvent': 8164993, 'WatchEvent': 4293727, 'pullRequests': 3189793, 'PushEvent': 3111647, 'issues': 2726111, 'PullRequestEvent': 2196604, 'forks': 2115311, 'PullRequestReviewCommentEvent': 1939511, 'IssuesEvent': 1816470, 'ForkEvent': 1310845, 'CreateEvent': 373706, 'DeleteEvent': 282479, 'CommitCommentEvent': 111338, 'releases': 85616, 'GollumEvent': 65208, 'ReleaseEvent': 32475, 'MemberEvent': 3179, 'PublicEvent': 94}
+repos with vulns but ZERO benign Commit candidates: 0 []
+repos with fewer benign Commit candidates than vulns: 0 []

@@ -1,0 +1,9 @@
+Commit events in repos with a fix: fixes 2886, benign 8610722
+  Hash   filled: fixes 100.00%   benign 100.00%
+  Add    filled: fixes 100.00%   benign 100.00%
+  Del    filled: fixes 100.00%   benign 100.00%
+  Files  filled: fixes 100.00%   benign 100.00%
+  name   filled: fixes 100.00%   benign 100.00%
+  Add    median: fixes 9  benign 6
+  Del    median: fixes 3  benign 2
+  Files  median: fixes 1  benign 1

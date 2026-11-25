@@ -1,0 +1,40 @@
+=== before
+repos: ['kobebeauty_php-contact-form', 'jonschlinkert_defaults-deep', 'jaw187_node-traceroute', 'derrekr_android_security', 'horazont_xmpp-http-upload', 'godaddy_node-config-shield', 'manvel-khnkoyan_jpv', 'ikeay_vinemv']
+PASS T1 default columns identical to original
+PASS T1 default repos identical
+PASS T1 default windows+details byte-identical
+PASS T2 columns identical (marker not a feature)
+PASS T2 same repos
+PASS T2 vulnerable windows identical after global padding (what training sees), details identical
+  (all-zero or empty windows in the Commit-only subset: 1)
+PASS T2 all 8 benign targets are Commit
+PASS T2 all 8 vulnerable targets are Commit
+  (original sampling on this subset: 7 of 8 benign targets not Commit)
+PASS T2 no benign target is a vulnerable event
+PASS T2 benign = vulnerable count per repo
+PASS T2 feature width matches original
+PASS T2 no window longer than B+B (40 rows)
+PASS T3 Commit-only build reproducible
+PASS T4 guard refuses flag=True comment=s7
+PASS T4 guard refuses flag=False comment=commitonly_s7
+ALL PASS
+=== only_before
+repos: ['kobebeauty_php-contact-form', 'jonschlinkert_defaults-deep', 'jaw187_node-traceroute', 'derrekr_android_security', 'horazont_xmpp-http-upload', 'godaddy_node-config-shield', 'manvel-khnkoyan_jpv', 'ikeay_vinemv']
+PASS T1 default columns identical to original
+PASS T1 default repos identical
+PASS T1 default windows+details byte-identical
+PASS T2 columns identical (marker not a feature)
+PASS T2 same repos
+PASS T2 vulnerable windows identical after global padding (what training sees), details identical
+  (all-zero or empty windows in the Commit-only subset: 1)
+PASS T2 all 8 benign targets are Commit
+PASS T2 all 8 vulnerable targets are Commit
+  (original sampling on this subset: 7 of 8 benign targets not Commit)
+PASS T2 no benign target is a vulnerable event
+PASS T2 benign = vulnerable count per repo
+PASS T2 feature width matches original
+PASS T2 no window longer than B+B (40 rows)
+PASS T3 Commit-only build reproducible
+PASS T4 guard refuses flag=True comment=s7
+PASS T4 guard refuses flag=False comment=commitonly_s7
+ALL PASS
