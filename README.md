@@ -51,6 +51,12 @@ the provenance record of every window (`*_repo`, `*_hash`, `*_event_type`, `*_cr
 
 ## Reassembling archives
 
+The `results/` folder is distributed as `results.tar.gz.part_00` ... `part_11` (GitHub upload limit). Rebuild it with:
+
+    sha256sum -c results_parts.sha256
+    cat results.tar.gz.part_* > results.tar.gz && tar -xzf results.tar.gz
+
+
 Repository-root data archives are split for hosting limits:
 
     cat graphql.zip.part_* > graphql.zip   # likewise json_commits, gh_cve_proccessed, cvefixes_test
