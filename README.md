@@ -49,6 +49,18 @@ the provenance record of every window (`*_repo`, `*_hash`, `*_event_type`, `*_cr
 `threshold` and the same provenance fields. File names encode architecture, window mode (`sym`/`causal`), window size
 (`b20`), seed (`s42`, ...) and whether the metadata block is excluded (`nometa`).
 
+## Trained fold models
+
+`fold_models_seed42.tar.gz.part_00` ... `part_13` hold the ten fold models (Keras 3) of the six headline configurations
+without metadata, seed 42: Transformer and Conv1D (symmetric and causal), GRU and BiLSTM (causal). One folder per
+configuration, named as the prediction files (e.g. `transformer_causal_b20_s42_nometa/fold_0.keras`).
+`fold_models_seed42_MAPPING.csv` maps each folder to its training log, and `fold_models_seed42_SHA256SUMS.txt`
+lists a hash per model. Load with `import models` from `code/model/` first (custom layers). Fold models for the
+other seeds are available on request.
+
+    sha256sum -c fold_models_seed42_parts.sha256
+    cat fold_models_seed42.tar.gz.part_* > fold_models_seed42.tar.gz && tar -xzf fold_models_seed42.tar.gz
+
 ## Reassembling archives
 
 The `results/` folder is distributed as `results.tar.gz.part_00` ... `part_11` (GitHub upload limit). Rebuild it with:
